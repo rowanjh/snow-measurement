@@ -1,0 +1,2040 @@
+---
+title: Measurement error in remotely sensed fractional snow cover datasets
+output:
+  html_document:
+    toc: yes
+    df_print: paged
+---
+
+# 1. Overview
+This notebook reproduces analyses from the below manuscript:
+
+Jacques-Hamilton, R., Valcu, M., Kwon, E.K., Versluijs, T., & Kempenaers, B. (2024). Measurement error in remotely sensed fractional snow cover datasets: implications for ecological research.
+
+Full code repository available at:
+https://github.com/rowanjh/barrow-snowmelt
+
+Data available at:
+https://zenodo.org/records/...
+
+
+```{r}
+# Setup
+knitr::opts_chunk$set(results='hold', message=FALSE, warning=FALSE)
+```
+
+# 2. Load packages & helper functions
+
+
+```{r}
+# Packages
+library(conflicted)
+library(here)
+library(terra)
+library(purrr)
+# library(glmmTMB)
+library(ggplot2)
+library(lubridate)
+library(mapview)
+library(tidyr)
+library(broom)
+# library(spdep)
+library(patchwork)
+# library(effects)
+library(glue)
+library(dplyr)
+library(forcats)
+library(sf)
+library(boot)
+library(car)
+
+# Check working directory is correctly set
+here::i_am("src/analysis-manuscript.Rmd")
+
+# helper functions for loading data
+source(here("src", "helpers-cover-geo.R"))
+
+# helper functions for piecewise linear interpolation
+source(here("src", "helpers-interpolation.R"))
+
+# Helper functions for loading egg data, nest data etc.
+source(here("src", "helpers-phenology.R"))
+
+# Miscellaneous utilities
+source(here("src", "utils", "drone-cam-calculator.R"))
+source(here("src", "utils", "utils.R"))
+
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::select)
+conflicts_prefer(lubridate::year)
+conflicts_prefer(lubridate::hour)
+conflicts_prefer(lubridate::minute)
+conflicts_prefer(lubridate::second)
+conflicts_prefer(base::intersect)
+
+```
+
+Helpful variables used throughout the notebook
+
+```{r}
+# Specify the date range for which snow cover is quantified
+FOCAL_PERIOD_START <- ymd_hms("2022-05-12 12:00:00", tz = "UTC")
+FOCAL_PERIOD_END <- ymd_hms("2022-07-15 12:00:00", tz = "UTC")
+
+# Plotting colours
+PLOT_COLS <- c("groundtruth" = "#c30010",
+               "Groundtruth" = "#c30010",
+               "MODIS_L2" = "#414487",
+               "MODIS_L3" = "#25848e",
+               "VIIRS_L3" = "#43bf71",
+               "Sentinel-2" = "#dee318",
+               "sentinel_slmnsn_appl" = "#dee318",
+               "sentinel_binary" = "#43bf71",
+               "sentinel_gascoin" = "#414487")
+
+# Labels for use in plots in the main text
+DATSET_LABELS <- c("MODIS_L2" = "MODIS_L2",
+                    "MODIS_L3" = "MODIS_L3",
+                    "VIIRS_L3" = "VIIRS_L3",
+                    "sentinel_slmnsn_appl" = "Sentinel-2")
+
+# Labels for use in the Sntinel-2 supplementary plots
+SENTINEL_LABELS <- c("sentinel_slmnsn_appl" = "Salomonson & Appel (2006)",
+                     "sentinel_gascoin" = "Gascoin et al., (2020)",
+                     "sentinel_binary" = "Binarization & aggregation")
+
+```
+
+# 3. Load data
+
+## Load snow data
+
+Load drone and satellite %cover estimates
+
+```{r}
+# Drone snow data
+SNOW_DR <- load_snow_data_drone() |>
+    # add 100% cover (pre-sampling) and 0% cover (post-sampling)
+    extrapolate_drone_data(backwards_to = FOCAL_PERIOD_START,
+                           forwards_to = FOCAL_PERIOD_END) |>
+    mutate(dt_offset = dtime_days(dt, FOCAL_PERIOD_START))
+
+
+# Load satellite cover data
+SNOW_SAT_MOD_VIIRS <- load_snow_data_nsidc()
+SNOW_SAT_SENTINEL <- load_snow_data_sentinel() |>
+    # Sentinel data file includes a larger date range, filter to focal period
+    filter(dt_collect >= FOCAL_PERIOD_START,
+           dt_collect <= FOCAL_PERIOD_END)
+
+# Combine MODIS, VIIRS, and Sentinel-2 data
+SNOW_SAT_2022_ALL_POLYS <- SNOW_SAT_MOD_VIIRS  |>
+    bind_rows(SNOW_SAT_SENTINEL) |>
+    mutate(dt_offset = dtime_days(dt_collect, FOCAL_PERIOD_START)) |>
+    # Nestsearch area polygon not used for this analysis, remove
+    filter(!poly_type %in% c("full_nestsearch_area"))
+
+head(SNOW_SAT_2022_ALL_POLYS )
+```
+
+## Load spatial data
+
+Load drone sampling grid & quadrats
+```{r}
+# Load sampling grid & spatial extent of for groundtruth survey
+DR_GRID <- get_dr_coords()
+EXTENT_DRONE <- get_drone_survey_extent()
+
+# Get footprint size of drone images (width and height in meters)
+DRN_IM_SIZE <- get_dimensions(60, cam_mavic)
+
+# Create spatial polygons giving approx ground footprints of drone images
+QUADRATS <-
+    rect_buffer(DR_GRID, DRN_IM_SIZE$img_width, DRN_IM_SIZE$img_height) |>
+    rename(poly_id = pt_id) |>
+    mutate(poly_type = "drone_grid")
+
+```
+
+## Load phenology data
+
+Load nest data, capture data, and other datasets from the field study
+
+```{r}
+# Load bird data
+NESTS <- get_nest_observations()
+EGGS_INCUBATOR <- get_egg_data()
+CAPS <- get_capture_data()
+
+# Get summary info for nests
+NEST_INFO <- summarise_nests(NESTS, EGGS_INCUBATOR) |>
+    st_intersection(EXTENT_DRONE)
+# EXTENT_NESTSEARCH <- get_nestsearch_extent(EXTENT_DRONE, NEST_INFO)
+
+# Get date of first capture for males
+CAPS <- get_capture_data()
+MALECAPS <- CAPS |>
+    filter(sex == "m") |>
+    arrange(dt_cap) |>
+    group_by(ID) |>
+    filter(dt_cap == min(dt_cap)) |>
+    ungroup() |>
+    mutate(maleID = paste0("M", ID))
+
+# Pool all phenological events
+PHEN_EVENTS <- bind_rows(
+    NEST_INFO |>
+        filter(!is.na(init_dt)) |>
+        select(nest, init_dt, geometry) |>
+        rename(poly_id = nest, dt_event = init_dt) |>
+        mutate(event_type = "nest_init"),
+    MALECAPS |>
+        select(maleID, dt_cap, geometry) |>
+        rename(poly_id = maleID, dt_event = dt_cap) |>
+        mutate(event_type = "male_firstcap")) |>
+    mutate(poly_id = paste0(poly_id, "_buff_500"))
+
+# Create polygons showing extraction buffers around target points. Buffers are
+# 500m diameter (250m radius)
+BUFFS_500 <- PHEN_EVENTS |>
+    st_buffer(500/2)
+
+```
+
+## Build snow models
+
+Create models of snow cover over time using satellite and drone datasets
+
+### Satellite snow models
+For satellite snow datasets, we represent snow cover over time using a sigmoid curve.
+
+A model is fit for each area of interest, resulting in up to 227 models per satellite dataset
+* 38 points
+* 132 male capture buffers
+* 56 nest buffers
+* 1 full plot
+
+Models are only fit if at least 6 satellite data points were available for that polygon during the focal study period.
+
+```{r}
+models_sat_glm <- SNOW_SAT_2022_ALL_POLYS |>
+    # Split data by dataset type and polygon id in a nested list
+    split(~dataset_type) |>
+    map(function(x) split(x, ~poly_id)) |>
+    # Fit a glm for each data subset. If the glm fails to fit, return NULL.
+    map(function(this_sat){
+        map(this_sat, function(dat_thispoly){
+            # Only fit a model if 6 or more satellite images are available
+            if (nrow(dat_thispoly) <= 5 ) return(NULL)
+            fit <- glm(cover_fudge ~ dt_offset,
+                 data = dat_thispoly,
+                 family = gaussian(link = "logit"),
+                 control = glm.control(maxit = 300))
+            # If the model fails to fit or does not converge, return NULL
+            if(is.na(fit$coefficients['dt_offset']))
+                return (NULL)
+            else if(!fit$converged)
+                return (NULL)
+            else
+                return(fit)
+        })
+    })
+```
+
+Make a timeline of snow cover predictions for each model: get the predicted %cover for every minute throughout the study period, for every polygon. This is used in plotting, linking datasets, and estimating threshold crossing dates. Creates a very large table, so maybe not optimal efficiency, but it works.
+
+```{r}
+# Create a minute-resolution timeline between the study start and end.
+# A snow cover estimate will be calculated for every minute
+pred_dts <- data.frame(
+    dt_offset =
+        seq(0, dtime_days(FOCAL_PERIOD_END, FOCAL_PERIOD_START), 1/24/60))
+
+# Go over every satellite dataset
+preds_sat_glm <- map(models_sat_glm, function(this_sat){
+        # Get a timeline of predictions for every polygon from this dataset
+        map(this_sat, function(thisfit) {
+            if (is.null(thisfit)) return (NA)
+            predict(thisfit, newdata = pred_dts, type = "response")
+        }) |>
+        # Reshape and combine all polygons
+        map(~data.frame(dt = pred_dts, cover_sat_glm = .x, row.names = NULL)) |>
+        bind_rows(.id = "poly_id")
+    }) |>
+    # Combine timelines from all polygons and all datasets into a big data.frame
+    bind_rows(.id = "dataset_type") |>
+    mutate(dt = FOCAL_PERIOD_START + dt_offset * 24 * 60 * 60) |>
+    relocate(dataset_type, poly_id, dt)
+
+# Sample rows of dataset
+set.seed(123)
+sample_row <- sample(1:nrow(preds_sat_glm),1)
+preds_sat_glm |> slice(sample_row:(sample_row+9))
+```
+
+### Drone snow models (for quadrats)
+
+For the drone dataset, snow cover at a given quadrat is modelled over time using piecewise linear interpolation; i.e. linearly interpolating observations. The table will have a %cover prediction for every minute, for each quadrat
+
+```{r}
+# Fit snow models on groundtruth data: piecewise linear interpolation
+models_drone_grid <- split(SNOW_DR, ~poly_id) |>
+    map(~approxfun(.x[['dt_offset']], .x[['cover']], yleft = 1))
+
+# Create list of predictions for every minute in the study period
+preds_dr_grid <- models_drone_grid |>
+    map(~.x(pred_dts$dt_offset)) |>
+    map(~data.frame(dt_offset = pred_dts$dt_offset,
+                    cover_dr_linterp = .x,
+                    row.names = NULL)) |>
+    bind_rows(.id = "poly_id") |>
+    filter(!is.na(cover_dr_linterp)) |>
+    mutate(dt = FOCAL_PERIOD_START + (dt_offset * 24 * 60 * 60),
+           dataset_type = "groundtruth") |>
+    relocate(dataset_type, poly_id)
+
+# Sample rows of dataset
+set.seed(1234)
+sample_row <- sample(1:nrow(preds_dr_grid),1)
+preds_dr_grid |> slice(sample_row:(sample_row+9))
+```
+
+### Drone snow models (nest/capsite buffers)
+
+To estimate snow cover over time in nest buffers using drone data, first find all quadrats that lie within the buffer, and take the average snowcover estimate from those quadrats.
+
+Example of how one nest/settlement buffer overlaps with drone quadrats
+```{r}
+set.seed(1234)
+mapview(QUADRATS) +
+    mapview(select(DR_GRID, geometry), cex = 2) +
+    mapview(slice_sample(BUFFS_500,n = 1))
+```
+
+Find quadrats that lie within each nest/capture site buffer
+```{r}
+all_nbrs_500 <- st_intersects(BUFFS_500, DR_GRID) |> as.data.frame()
+all_nbrs_500$poly_id <- BUFFS_500$poly_id[all_nbrs_500$row.id]
+all_nbrs_500$pt_id <- DR_GRID$pt_id[all_nbrs_500$col.id]
+```
+
+Descriptive statistics for the buffers
+```{r}
+print("Number of quadrats within 500m buffer of nest/malecap sites:")
+all_nbrs_500 |>
+    group_by(poly_id) |>
+    count(name = "N_quadrats_in_buffer") |>
+    group_by(N_quadrats_in_buffer) |> 
+    count(name = "N_buffers")
+```
+```{r}
+temp_zeros <- PHEN_EVENTS$poly_id[!PHEN_EVENTS$poly_id %in% all_nbrs_500$poly_id] |>
+    length()
+
+glue("{temp_zeros} buffers contained zero quadrats")
+
+```
+
+Estimate drone snow cover within each buffer as the average %cover of all quadrats within the buffer.
+```{r}
+buffer_ids <- unique(PHEN_EVENTS$poly_id)
+results <- init_list(names = buffer_ids)
+for (id in buffer_ids) {
+    # Get quadrats within the buffer zone for this nest/capsite
+    nbrs <- all_nbrs_500[all_nbrs_500$poly_id == id, "pt_id"]
+    if (length(nbrs) == 0)
+        next
+
+    # Get mean snow cover from these quadrats. Take snow cover from the
+    # prediction timeseries calculated earlier
+    results[[id]] <- preds_dr_grid |>
+        filter(poly_id %in% nbrs) |>
+        group_by(dt) |>
+        summarise(cover_dr_patch = mean(cover_dr_linterp))
+
+    results[[id]]
+}
+
+# Collate predictions for all nest/cap buffers into a single data.frame
+preds_dr_buffers <- map(results, bind_rows) |>
+    bind_rows(.id = "poly_id") |>
+    mutate(dataset_type = "groundtruth") |>
+    relocate(dataset_type, poly_id)
+
+# Sample rows of dataset
+set.seed(321)
+sample_row <- sample(1:nrow(preds_dr_buffers),1)
+preds_dr_buffers |> slice(sample_row:(sample_row+9))
+```
+
+### Drone full-plot model
+
+To estimate full-plot cover using the drone dataset, simply take the average of all quadrats
+```{r}
+preds_dr_fullplot <- preds_dr_grid |>
+    group_by(dt) |>
+    summarise(cover_dr_fullplot = mean(cover_dr_linterp)) |>
+    mutate(dataset_type = "groundtruth",
+           poly_id = "full_plot") |>
+    relocate(dataset_type, poly_id, dt)
+
+# Show sample rows from dataset
+set.seed(1234)
+sample_row <- sample(1:nrow(preds_dr_fullplot),1)
+preds_dr_fullplot |> slice(sample_row:(sample_row+9))
+```
+
+### Get complete cases
+
+Check how many quadrats and buffers had enough data points available for modelling, by dataset. All drone models fit successfully, but some satellite models failed to fit due to e.g. having few available datapoints
+
+```{r}
+# Count how many glm models were fit for each satellite dataset.
+paste("number of successfully fit satellite sigmoid snow models, by dataset:")
+
+map_dbl(models_sat_glm, function(this_sat){
+  map_lgl(this_sat, ~length(.x) > 0) |> sum()
+})
+```
+
+Get the set of polygons with successful model fit for every dataset. This will be the subset used for analyses involving snow models.
+```{r}
+all_polys <- unique(SNOW_SAT_2022_ALL_POLYS$poly_id)
+
+polys_available_all_sat <- map(models_sat_glm, \(x) names(x)[!map_lgl(x, is.null)]) |>
+    reduce(intersect)
+polys_available_dr <- c(preds_dr_buffers$poly_id |> unique(),
+                        preds_dr_grid$poly_id |> unique(),
+                        preds_dr_fullplot$poly_id |> unique())
+
+POLYS_KEEP <- intersect(polys_available_all_sat, polys_available_dr)
+
+SNOW_SAT_2022 <- SNOW_SAT_2022_ALL_POLYS |>
+    filter(poly_id %in% POLYS_KEEP)
+
+# Show table of how many polygons are kept
+data.frame(poly_id = all_polys) |>
+    filter(poly_id != "full_plot") |>
+    mutate(keep = poly_id %in% POLYS_KEEP,
+           type = case_when(grepl("^P", poly_id) ~ "nest_buffer",
+                            grepl("pt", poly_id) ~ "quadrat",
+                            grepl("^M", poly_id) ~ "settlement_buffer")) |> 
+    group_by(type) |> 
+    summarise(n_polygons_total = n(),
+              n_polygons_keep = sum(keep))
+```
+
+## Match satellite and drone observations
+
+Pair each satellite observation with a drone observations collected within 12h where possible.
+
+### Match contemporaneous drone and satellite observations
+
+For every satellite image collected for a quadrat, find pairwise differences in datetimes with all drone images. Extract pairs of images with the nearest collection time (with a maximum 12 hours). Note that the satellite time is in UTC timezone, whereas drone time is in Alaska timezone, this is accounted for when matching images
+
+```{r}
+# Create results holder
+polygons <- unique(SNOW_DR$poly_id)
+sat_datasets <- unique(SNOW_SAT_2022_ALL_POLYS$dataset_type)
+results <- init_list(names = sat_datasets,
+                     contents = init_list(polygons))
+
+# Loop over satellite datasets and quadrats, find matching pairs
+for(ds in unique(SNOW_SAT_2022_ALL_POLYS$dataset_type)){
+    for(p in unique(SNOW_DR$poly_id)){
+        # Get dates of available groundtruth data for this quadrat
+        dts_ground <- SNOW_DR |>
+            filter(poly_id == p) |>
+            pull(dt) |>
+            dtime_hrs(FOCAL_PERIOD_START)
+        # Get dates of available satellite data for this quadrat
+        dts_sat <- SNOW_SAT_2022_ALL_POLYS |>
+            filter(poly_id == p & dataset_type == ds) |>
+            pull(dt_collect) |>
+            dtime_hrs(FOCAL_PERIOD_START)
+
+        if (length(dts_sat) == 0) next
+
+        # Get a matrix showing time differences between all pairs of images
+        # outer: rows = drone datapoints, columns = satellite datapoints)
+        diffs <- outer(dts_ground, dts_sat, FUN = "-")
+        diffs <- as.data.frame(diffs)
+        # Add the relevant satellite rowid's as column labels
+        names(diffs) <- SNOW_SAT_2022_ALL_POLYS |>
+            filter(poly_id == p & dataset_type == ds) |>
+            pull(rowid)
+        # Add a column for drone row ids
+        diffs$rowid_drone <- SNOW_DR |>
+            filter(poly_id == p) |>
+            pull(rowid)
+        # Get each drone-satellite candidate pair
+        pairs <- diffs |>
+            pivot_longer(-rowid_drone,
+                         names_to = "rowid_sat",
+                         values_to = "diff_hrs")
+        # Find pairs with time difference less than 12 hours
+        results[[ds]][[p]] <- pairs |>
+            filter(abs(diff_hrs) <= 12)
+    }
+}
+# Rows = drone imgs, cols = sat imgs
+matches <- results |>
+    map(~bind_rows(.x, .id = "poly_id")) |>
+    bind_rows(.id = "dataset_type")
+
+
+# If a satellite image matches to multiple drone images, keep closest match
+# (but a groundtruth value can be matched to multiple satellite images)
+matches <- matches |>
+    group_by(rowid_sat) |>
+    filter(abs(diff_hrs) == min(abs(diff_hrs))) |>
+    # If multiple matches with the same time difference, keep the first
+    distinct(rowid_sat, .keep_all = TRUE) |>
+    ungroup()
+
+# Join %cover from satellite and groundtruth datasets
+COVERS_MATCHED_RAW <- SNOW_DR |>
+    select(rowid, dt, poly_id, cover) |>
+    st_drop_geometry() |>
+    rename(dt_ground = dt,
+           cover_dr = cover) %>%
+    left_join(matches, ., by = c("poly_id", "rowid_drone" = "rowid"))
+
+COVERS_MATCHED_RAW <- SNOW_SAT_2022_ALL_POLYS |>
+    select(rowid, dt_collect, cover) |>
+    rename(dt_sat = dt_collect,
+           cover_sat = cover,
+           rowid_sat = rowid) %>%
+    left_join(COVERS_MATCHED_RAW, ., by = "rowid_sat") |>
+    filter(!is.na(cover_sat))
+
+head(COVERS_MATCHED_RAW)
+```
+
+### Extract satellite model estimate for every drone image
+
+Get an estimate of %cover from sat glm models for each polygon from the time of each drone survey. Unlike the previous block which used the original satellite observation, this block will extract the prediction from the sigmoid snow depletion model.
+
+```{r}
+# Get the datetime of every drone survey.
+dronesurvey_dts <- SNOW_DR |>
+    st_drop_geometry() |>
+    group_by(date) |>
+    summarise(dt = mean(dt),
+              dt_offset = mean(dt_offset))
+
+
+# Get satellite predictions for all polygons at time of drone survey
+sat_glmpreds_dronematch <-
+    # map over each satellite type
+    map(models_sat_glm, function(sat_type){
+        # and within each satellite type, map over the model for every polygon
+        map(sat_type, function(thisfit){
+            if(is.null(thisfit)) return(NA)
+            # Predict cover for this polygon at each drone survey time
+            predict(thisfit, newdata = dronesurvey_dts, type = "response")
+            }) |>
+        # Add datetime offset column to predictions
+        map(~data.frame(dt_offset = dronesurvey_dts$dt_offset,
+                        cover_sat = .x, row.names = NULL)) |>
+        bind_rows(.id = "poly_id") |>
+        # Convert back to real datetime
+        mutate(dt_sat = FOCAL_PERIOD_START + (dt_offset * 24 * 60 * 60),
+               dt_sat = with_tz(dt_sat, TZ_AK),
+               date = as_date(dt_sat)) |>
+        select(poly_id, dt_sat, date, cover_sat)
+    }) |>
+    bind_rows(.id = "dataset_type")
+
+# Now join the satellite %cover predictions to the drone %cover estimates
+COVERS_MATCHED_INTERP <- SNOW_DR |>
+    st_drop_geometry() |>
+    select(poly_id, dt, date, cover) |>
+    rename(cover_dr = cover,
+           dt_ground = dt) |>
+    left_join(sat_glmpreds_dronematch, by = c("poly_id", "date")) |>
+    select(-date) |>
+    # For some polygons a snow cover model could not be fit e.g. due to
+    # which puts NAs in the dataset. exclude these.
+    filter(!is.na(cover_sat))
+
+set.seed(1234)
+slice_sample(COVERS_MATCHED_INTERP, n=10)
+
+```
+
+### Merge all matched data for plotting
+
+```{r}
+COVERS_MATCHED_ALL <- bind_rows(
+    COVERS_MATCHED_RAW |> mutate(type = "sat_raw"),
+    COVERS_MATCHED_INTERP |> mutate(type = "sat_glm")) |>
+    mutate(type = factor(type,
+                         levels = c("sat_raw", "sat_glm"),
+                         labels = c("Raw observations",
+                                    "GLM predictions")))
+```
+
+## Get threshold crossing estimates
+
+Estimate the date of crossing % cover thresholds of interest from satellite and drone datasets
+
+```{r}
+# Thresholds to estimate a date for
+cover_thresh = c(0.25, 0.5, 0.75)
+
+# For more thresholds:
+# cover_thresh = c(0.01, seq(.05, .95, .05), 0.99)
+```
+
+### Drone quadrat thresholds
+
+Estimate threshold crossing dates for every quadrat using drone data
+
+```{r}
+thresh_cross_dr_quadrats <- SNOW_DR |>
+    arrange(poly_id, dt) |>
+    split(~poly_id) |>
+    # Linearly interpolate between each prediction point to estimate where the
+    # threshold is crossed, using a custom function
+    map(~get_linterp_thresholds(.x$dt_offset,
+                                .x$cover,
+                                thresh = cover_thresh)) |>
+    map(as.data.frame) |>
+    bind_rows(.id = "poly_id") |>
+    mutate(dt = FOCAL_PERIOD_START + (dt_offset * 24 * 60 * 60)) |>
+    select(-dt_offset)
+```
+
+Estimate threshold crossing dates for every nesting and male settlement buffer using drone data
+
+```{r}
+# Get threshold crossing estimates
+thresh_cross_dr_buffers <- preds_dr_buffers  |>
+    split(~poly_id) |>
+    map(~get_linterp_thresholds(cover = .x$cover_dr_patch,
+                               dt = .x$dt,
+                               thresh = cover_thresh)) |>
+    bind_rows(.id = "poly_id")
+
+```
+
+Estimate threshold crossing dates for the total plot area using drone data
+
+```{r}
+thresh_cross_dr_fullplot <-
+    get_linterp_thresholds(cover = preds_dr_fullplot$cover_dr_fullplot,
+                           dt = preds_dr_fullplot$dt,
+                           thresh = cover_thresh) |>
+    mutate(poly_id = "full_plot")
+```
+
+Collate threshold crossing dates
+
+```{r}
+thresh_cross_dr_all <-
+    bind_rows(thresh_cross_dr_quadrats,
+              thresh_cross_dr_buffers,
+              thresh_cross_dr_fullplot) |>
+    mutate(dataset_type = "groundtruth") |>
+    rename(dt_cross = dt) |>
+    relocate(dataset_type, poly_id)
+```
+
+### Satellite threshold estimation
+
+Estimate crossing of %cover thresholds for all satellite quadrats, using the predictions from the satellite glm models.
+
+```{r}
+# Get a prediction from models for every hour
+dts_predict <- seq.POSIXt(from = with_tz(FOCAL_PERIOD_START, tz = TZ_AK),
+                          to = with_tz(FOCAL_PERIOD_END, tz = TZ_AK),
+                          by = 60*60)
+
+dts_predict_offset <- dtime_days(dts_predict, FOCAL_PERIOD_START)
+
+pred_dts <-  data.frame(dt_offset = dts_predict_offset)
+
+# Estimate threshold crossing date from satellite data:
+
+thresh_cross_sat <- models_sat_glm |>
+    # Map over every satellite dataset and every polygon
+    map(function(sat_type){
+        map(sat_type, function(fit){
+            if(is.null(fit))
+                return(NULL)
+            # Get hourly model predictions for this polygon/dataset
+            preds <- predict(fit, newdata = pred_dts, type = "response")
+            # Use approx function to find threshold crossing dates. by
+            # linearly interpolating the hourly predictions data points. This is
+            # different to the method used for drone data (which used a custom
+            # function) becase the drone dataset needed to account for multiple
+            # possible crossing points, which is not supported by approx(). The
+            # satellite sigmoid models give monotonically decreasing values over
+            # time, so approx() is a simpler way to achieve this
+            dt_ests <- approx(x = preds[!duplicated(preds)],
+                              y = pred_dts$dt_offset[!duplicated(preds)],
+                        xout = cover_thresh)
+            data.frame(thresh = dt_ests$x, dt_offset = dt_ests$y)
+        }) |>
+        bind_rows(.id = "poly_id") |>
+        mutate(dt_cross = FOCAL_PERIOD_START + (dt_offset * 24 * 60 * 60))# |>
+    }) |>
+    bind_rows(.id = "dataset_type")
+
+```
+
+Collate all threshold crossing date estimates
+```{r}
+# Combine satellite and groundtruth estimates
+THRESH_CROSSINGS_LONG <- bind_rows(thresh_cross_dr_all, thresh_cross_sat) |>
+    select(-dt_offset)
+THRESH_CROSSINGS_WIDE <- THRESH_CROSSINGS_LONG |>
+    pivot_wider(id_cols = c(dataset_type, poly_id), names_from = thresh,
+                values_from = dt_cross, names_prefix = "thresh_")
+
+THRESH_CROSSINGS_OFFSET <- THRESH_CROSSINGS_LONG |>
+    pivot_wider(names_from = dataset_type, values_from = dt_cross) |>
+    pivot_longer(c(MODIS_L2, MODIS_L3, VIIRS_L3, matches("senti")),
+                 names_to = "sat_type",
+                 values_to = "sat_dt") |>
+    rename(drone_dt = groundtruth) |>
+    filter(!is.na(drone_dt))
+head(THRESH_CROSSINGS_WIDE)
+```
+
+## Estimate %cover at nesting/settlement times
+
+For each settlement location, estimate %cover in the 250m buffer at the time that the bird settled there. Similarly, for each nest, estimate %cover in the 250m buffer around the nest at the time of nest initiation.
+
+```{r}
+# Collate all predictions into one object
+preds_collated <- bind_rows(preds_sat_glm |>
+                                rename(cover = cover_sat_glm),
+                            preds_dr_buffers |>
+                                rename(cover = cover_dr_patch),
+                            preds_dr_fullplot |>
+                                rename(cover = cover_dr_fullplot))
+
+# Get times of nesting and settlement events. Round to nearest second to
+# easily extract the value from the data.frame with collated predictions
+EVENT_COVERS <- PHEN_EVENTS |>
+    st_drop_geometry() |>
+    mutate(dt_round = `second<-`(dt_event, 0)) |>
+    left_join(preds_collated |> select(-dt_offset),
+              by = c("poly_id", "dt_round" = "dt"))
+
+```
+
+
+# 4. Methods
+
+## Dataset description
+
+### N available satellite images
+Number of satellite images available from NSIDC
+(Sentinel-2 dataset details not available here)
+```{r}
+datasets_nsidc <- list(
+    "MODIS_L2_TERRA" = here("data", "satellite", "MOD10_L2", "2022"),
+    "MODIS_L2_AQUA" = here("data", "satellite", "MYD10_L2", "2022"),
+    "MODIS_L3_TERRA" = here("data", "satellite", "MOD10A1", "2022"),
+    "MODIS_L3_AQUA" = here("data", "satellite", "MYD10A1", "2022"),
+    "VIIRS_L3" = here("data", "satellite", "VNP10A1", "2022"))
+
+count_files <- function(dir){
+    fs <- list.files(dir)
+    # each image has 4 files, 1 for each layer. So count the number of files
+    # that are an algorithm flags layer (arbitrarily selected)
+    fs[grepl("Algorith", fs)] |> unique() |> length()
+}
+
+ns_nsidc <- map(datasets_nsidc, count_files)
+
+ns_nsidc
+```
+
+### N satellite images suitable for analysis
+
+```{r}
+# Take the dataset used in the analysis, work out number of imgs for NSIDC datasets
+SNOW_SAT_2022_ALL_POLYS |>
+    filter(!grepl("sentinel", dataset_type)) |>
+    mutate(sat = case_when(
+        grepl("^MOD10_L2", file_stem) ~ "MOD10_L2",
+        grepl("^MYD10_L2", file_stem) ~ "MYD10_L2",
+        grepl("^MOD10A1", file_stem) ~ "MOD10A1",
+        grepl("^MYD10A1", file_stem) ~ "MYD10A1",
+        grepl("^VNP10A1", file_stem) ~ "VNP10A1")
+    ) |>
+    # Get the number of unique files for each satellite type
+    group_by(sat, file_stem) |> count() |>
+    group_by(sat) |> summarise(n_sat_images_suitable = length(unique(file_stem)))
+
+# For sentinel datasets
+print("n sentinel images used: ")
+SNOW_SAT_2022_ALL_POLYS |>
+    filter(dataset_type == "sentinel_slmnsn_appl") |>
+    pull(dt_collect) |> unique() |> length()
+```
+
+### N satellite retrievals able to be matched to a drone groundtruth
+```{r}
+print(paste("Number of usable satellite quadrat retrievals in total:",
+            nrow(SNOW_SAT_2022_ALL_POLYS |> filter(grepl("pt_", poly_id)))))
+print(paste("Number of satellite quadrat retrievals with a matching %cover",
+            "value available in the drone dataset:",
+            length(COVERS_MATCHED_RAW$rowid_sat)))
+```
+
+# 5. Results: bias quantification
+
+## Plot snow melt trajectories (full-plot area)
+
+Collate data for use in snow depletion plots
+
+```{r}
+# Collect satellite estimates of full-plot snow cover over time
+glm_preds_fullplot <- bind_rows(
+    models_sat_glm$MODIS_L2$full_plot |>
+        predict(newdata = pred_dts, se.fit = TRUE, type = 'response') |>
+        as.data.frame() |>
+        mutate(dataset_type = "MODIS_L2", dt = pred_dts$dt_offset),
+    models_sat_glm$MODIS_L3$full_plot |>
+        predict(newdata = pred_dts, se.fit = TRUE, type = 'response') |>
+        as.data.frame() |>
+        mutate(dataset_type = "MODIS_L3", dt = pred_dts$dt_offset),
+    models_sat_glm$VIIRS_L3$full_plot |>
+        predict(newdata = pred_dts, se.fit = TRUE, type = 'response') |>
+        as.data.frame() |>
+        mutate(dataset_type = "VIIRS_L3", dt = pred_dts$dt_offset),
+    models_sat_glm$sentinel_slmnsn_appl$full_plot |>
+        predict(newdata = pred_dts, se.fit = TRUE, type = 'response') |>
+        as.data.frame() |>
+        mutate(dataset_type = "sentinel_slmnsn_appl", dt = pred_dts$dt_offset)
+) |>
+    mutate(dt_collect = FOCAL_PERIOD_START + dt * 24 * 60 * 60,
+           type = "sat_glm",
+           poly_id = "full_plot") |>
+    rename(cover = fit, dt_collect = dt, dt_offset = dt) |>
+    select(poly_id, dataset_type, dt_collect, cover, type)
+
+# All satellite %cover observations for full-plot area
+raw_sat_points_fullplot <- SNOW_SAT_2022_ALL_POLYS |>
+    filter(!dataset_type %in% c("sentinel_gascoin", "sentinel_binary"),
+           poly_id == "full_plot") |>
+    select(dataset_type, poly_id, dt_collect, dt_offset, cover) |>
+    mutate(type = "sat_raw")
+
+# All drone %cover estimates for full-plot area
+dr_preds_fullplot <- preds_dr_fullplot |>
+    # Thin out the dataset a bit for more efficient plotting
+    filter((row_number() %% 100) == 1) |>
+    select(dt, cover_dr_fullplot) |>
+    rename(cover = cover_dr_fullplot, dt_collect = dt) |>
+    mutate(dataset_type =  "groundtruth", type = "gt", poly_id = "full_plot")
+
+# Collate all plotting data
+plotdat_snow_depletion_fullplot <-
+    bind_rows(
+        glm_preds_fullplot |> mutate(plot_facet = dataset_type),
+        raw_sat_points_fullplot |> mutate(plot_facet = dataset_type) |>
+            filter(dataset_type != "sentinel_binary"),
+        dr_preds_fullplot |> mutate(plot_facet = "MODIS_L2"),
+        dr_preds_fullplot |> mutate(plot_facet = "MODIS_L3"),
+        dr_preds_fullplot |> mutate(plot_facet = "VIIRS_L3"),
+        dr_preds_fullplot |> mutate(plot_facet = "sentinel_slmnsn_appl"))
+
+
+```
+
+Plot snow depletion over time for full-plot area. The cumulative number of nests or male captures is added to the plot later
+
+```{r}
+p_snow_depletion_fullplot <-
+    ggplot(mapping = aes(x = dt_collect, y = cover * 100,
+                         fill = dataset_type, colour = dataset_type)) +
+    geom_line(data = plotdat_snow_depletion_fullplot |>
+                  filter(type %in% c("gt", "sat_glm"))) +
+    geom_point(data = plotdat_snow_depletion_fullplot |>
+                   filter(type == "sat_raw"), pch = 21,
+               colour = "black") +
+    facet_wrap(~plot_facet, ncol = 2, labeller = as_labeller(DATSET_LABELS)) +
+    scale_colour_manual(values = PLOT_COLS) +
+    scale_fill_manual(values = PLOT_COLS) +
+    scale_x_datetime(date_breaks = "7 days") +
+    theme_bw() +
+    theme(panel.grid = element_blank(),
+          strip.background = element_rect(fill = NA)) +
+    xlab("Date") +
+    scale_y_continuous(name = "FSC (%)") +#,
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+    theme(legend.position = "none")
+
+
+p_snow_depletion_fullplot
+```
+
+## Plot bias/error by FSC
+
+Plot of bias/rmse by FSC for each dataset
+
+```{r, fig.width=6.2, fig.height=5}
+# calculate bias/rmse for these bins
+bin_breaks <- c(-0.001, 0.0001, 0.1, 0.2, 0.3, 0.4, 0.5,
+                0.6, 0.7, 0.8, 0.9, 0.9999, 1.01)
+
+rmse <- function(actual, predicted){
+    sqrt(mean((actual - predicted)^2))
+}
+
+plotdat <- COVERS_MATCHED_ALL |>
+    filter(!dataset_type %in% c("sentinel_gascoin", "sentinel_binary")) |>
+    mutate(cover_dr = cover_dr * 100,
+           cover_sat = cover_sat * 100) |>
+    mutate(bin = cut(cover_dr, bin_breaks * 100),
+           bin = fct_recode(bin,
+                            "0.0"  = "(-0.1,0.01]",
+                            "(0.0,10]" = "(0.01,10]",
+                            "100" = "(100,101]")) |>
+    group_by(dataset_type, type, bin) |>
+    summarise(bias = mean(cover_sat - cover_dr),
+              rmse = rmse(cover_sat, cover_dr),
+              n = n()) |>
+    mutate(bias = ifelse(n<3, NA, bias),
+           rmse = ifelse(n<3, NA, rmse)) |>
+    select(-n) |>
+    ungroup() |>
+    pivot_longer(c(bias, rmse), names_to = "stat_type",
+                 values_to = "stat") |>
+    mutate(stat_type = factor(stat_type, levels = c("bias", "rmse"),#, "sd"),
+                              labels = c("Bias (%)", "RMSE (%)"))) |>#,
+                                         #"Std. Deviation (%)"))) |>
+    # Reorder dataset labels
+    mutate(dataset_type = factor(dataset_type,
+                                 levels = names(DATSET_LABELS),
+                                 labels = DATSET_LABELS))
+
+p_bias_fsc <- plotdat |>
+    ggplot(aes(x = bin, y = stat,
+           colour = dataset_type, fill = dataset_type, group = dataset_type)) +
+    geom_hline(data = data.frame(yint = 0, stat_type = c("Bias (%)")),
+               aes(yintercept = yint),colour = "grey50") +
+    geom_line() +
+    geom_point(aes(fill = dataset_type, pch = dataset_type), colour = "black")+
+    facet_grid(stat_type~type, scales = "free_y", switch = "y") +
+    theme_bw() +
+    theme(panel.grid.major.y = element_blank(),
+          panel.grid.minor.y = element_blank(),
+          strip.background = element_rect(fill = NA)) +
+    scale_shape_manual(values = c(21:25)) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+    theme(panel.border =
+              element_rect(color = "black", fill = NA, linewidth = 1)) +
+    xlab("Ground truth FSC (%)") +
+    ylab(NULL) +
+    scale_colour_manual(values = PLOT_COLS) +
+    scale_fill_manual(values = PLOT_COLS) +
+    theme(legend.position = "bottom", legend.direction = "horizontal",
+          legend.title = element_blank())
+p_bias_fsc
+
+```
+
+## Plot date estimation bias
+
+```{r, fig.width=6.2, fig.height=5}
+plotdat_thresh_cross <- THRESH_CROSSINGS_OFFSET |>
+    filter(!sat_type %in% c("sentinel_gascoin", "sentinel_binary")) |>
+    filter(grepl("^pt_", poly_id)) |>
+    filter(poly_id %in% POLYS_KEEP) |>
+    mutate(threshfac = factor(thresh),
+           threshfac = factor(threshfac, levels = rev(levels(threshfac))),
+           days_diff = dtime_days(sat_dt, drone_dt)) |>
+    filter(threshfac %in% c("0.25", "0.5", "0.75")) |>
+    mutate(thresh = case_when(
+        threshfac == 0.25 ~ "25%",
+        threshfac == 0.5 ~ "50%",
+        threshfac == 0.75 ~ "75%")) |>
+    mutate(sat_type = factor(sat_type,
+                      levels = rev(names(DATSET_LABELS)),
+                      labels = rev(DATSET_LABELS)))
+
+p_bias_date <- plotdat_thresh_cross |>
+    filter(grepl("pt_", poly_id)) |>
+    filter(poly_id %in% POLYS_KEEP) |>
+    mutate(thresh = factor(thresh),
+           thresh = factor(thresh, levels = rev(levels(thresh)))) |>
+    ggplot(aes(x = days_diff, y = sat_type, fill = sat_type)) +
+    # geom_hline(yintercept = 0, colour = "grey70") +
+    geom_vline(xintercept = 0, colour = "#c30010") +
+    geom_boxplot(outlier.shape = NA) +
+    geom_point(size = 1, pch = 1, position = position_jitter(height = 0.1)) +
+    # geom_violin(draw_quantiles = c(0.5)) +
+    xlab("Bias in date estimate (days)") +
+    ylab("Dataset") +
+    theme(axis.text.x = element_text(angle = 90)) +
+    theme_bw() +
+    theme(panel.grid.major.y = element_blank(),
+          panel.grid.minor.y = element_blank(),
+          strip.background = element_rect(fill = NA)) +
+    facet_wrap(~factor(thresh), ncol = 1, ) +
+    scale_fill_manual(values = PLOT_COLS[-1]) +
+    scale_x_continuous(breaks = seq(-10, 20, 2)) +
+    # guides(fill = guide_legend(reverse = TRUE)) +
+    theme(axis.text.y = element_blank(),
+          axis.title.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          legend.position = "bottom",
+          legend.direction = "horizontal",
+          legend.title = element_blank()) +
+    guides(fill = guide_legend(reverse=T))
+
+p_bias_date
+```
+
+## Table for overall bias metrics
+
+Overall FSC point estimation bias and error (in % units)
+```{r}
+COVERS_MATCHED_ALL |>
+    filter(!dataset_type %in% c("sentinel_gascoin", "sentinel_binary")) |>
+    mutate(cover_sat = cover_sat * 100,
+           cover_dr = cover_dr * 100,
+           error = cover_sat - cover_dr) |>
+    group_by(dataset_type) |>
+    summarise(bias = mean(error),
+              rmse = rmse(cover_dr, cover_sat),
+              r = cor(cover_dr, cover_sat))
+```
+
+Overall date estimate bias
+
+```{r}
+# Bias for 50% cover threshold
+THRESH_CROSSINGS_OFFSET |>
+    filter(!sat_type %in% c("sentinel_gascoin", "sentinel_binary")) |>
+    filter(poly_id %in% POLYS_KEEP) |>
+    filter(grepl("pt_", poly_id)) |>
+    filter(thresh == 0.5) |>
+    group_by(sat_type) |>
+    summarise(days_bias = dtime_days(sat_dt, drone_dt) |>
+                  mean(na.rm = TRUE) |> round(2))
+
+```
+
+## Number of ground control points used
+
+```{r}
+n_pt_bias <- COVERS_MATCHED_ALL$poly_id |> unique() |> length()
+print("All 38 ground control points used for quantifying bias in point estimates")
+THRESH_CROSSINGS_OFFSET |>
+    filter(poly_id %in% POLYS_KEEP) |>
+    filter(grepl("pt_", poly_id)) |>
+    pull(poly_id) |>
+    unique() |>
+    length() %>%
+    paste0(., " ground control points used for quantifying bias in date estimates")
+
+```
+
+# 6. Results: impact of bias on ecological inferences
+## Phenological data description
+
+### N nests and caps
+
+Some nest and settlement sites were excluded from the analysis if there were insufficient drone or satellite datapoints available for that location.
+
+```{r}
+NEST_INFO$nest |> unique() |> length() |>
+    paste("nests were found")
+
+POLYS_KEEP %>% grepl("^P", .) |> sum() |>
+    paste("nests were used in analyses")
+
+MALECAPS$maleID |> unique() |> length() |>
+    paste("males were captured")
+
+POLYS_KEEP %>% grepl("^M", .) |> sum() |>
+    paste("males were used in analyses")
+
+```
+### n quadrats per buffer
+
+The average number of drone quadrats contained within a nest/settlement location
+
+```{r}
+n_quads_per_buffer <- BUFFS_500 |> filter(BUFFS_500$poly_id %in% POLYS_KEEP) |>
+    st_intersects(QUADRATS) |>
+    map_dbl(length)
+mean(n_quads_per_buffer) %>% round(2) %>%
+    paste("mean number of quadrats per buffer: ", .)
+min(n_quads_per_buffer) %>% paste("min quadrats per buffer: ", .)
+max(n_quads_per_buffer) %>% paste("max quadrats per buffer: ", .)
+```
+
+### Cumulative number of nests/arrivals
+
+Get the cumulative number of nests over time, against cumulative snow melt
+
+```{r}
+# Get the cumulative number of nesting or settlement events every one hour
+cumsum_dts <- data.frame(dt = seq.POSIXt(
+    from = as.POSIXct("2022-05-14 00:00:00", tz = TZ_AK),
+    to = as.POSIXct("2022-07-10 23:59:59", tz = TZ_AK),
+    by = 60*60))
+
+nest_cumsum <- cumsum_dts |>
+    # For every hour, see if there was a nesting event
+    left_join(
+        NEST_INFO |>
+            st_drop_geometry() |>
+            rename(dt = init_dt) |>
+            filter(!is.na(dt)) |>
+            mutate(dt = `minute<-`(dt, 0), dt = `second<-`(dt, 0)) |>
+            group_by(dt) |>
+            count()
+    ) |>
+    # Get the cumulative sum of nesting events
+    mutate(n = ifelse(is.na(n),0, n),
+           cumulative_nests = cumsum(n)) |>
+    rename(n_nests = n)
+
+malecap_cumsum <- cumsum_dts |>
+    left_join(
+        MALECAPS |>
+            st_drop_geometry() |>
+            rename(dt = dt_cap) |>
+            mutate(dt = `minute<-`(dt, 0), dt = `second<-`(dt, 0)) |>
+            group_by(dt) |>
+            count()
+    ) |>
+    mutate(n = ifelse(is.na(n),0, n),
+           cumulative_malecaps = cumsum(n)) |>
+    rename(n_malecaps = n)
+
+```
+Add cumulative number of nests and male settlement events to the snow depletion plot
+
+```{r}
+p_snow_depletion_cumsum <- p_snow_depletion_fullplot +
+    geom_line(data = nest_cumsum,
+              aes(x = dt, y = cumulative_nests/48*100, colour = "grey60",
+                  fill = NULL),
+              lty = 3) +
+    geom_line(data = malecap_cumsum,
+              aes(x = dt, y = cumulative_malecaps/132*100, colour = "grey30",
+                  fill = NULL),
+               lty = 2)
+
+p_snow_depletion_cumsum
+```
+
+## Forest plot
+
+We estimate how nest initiation and male settlement relate to %cover and the timing of snow melt in the local 500m buffer.
+
+### %cover at nesting/settlement event
+
+Estimate %cover in each nest buffer at the time of nest initiation &
+Estimate %cover in each settlement location buffer at the time of settlement.
+
+Then calculate mean %cover in the buffer for nest or settlement events, with a bootstrapped 95% confidence interval is calculated.
+
+```{r}
+# Calculate means & CIs
+mean.fun <- function(x, i)
+    mean(x[i], na.rm = TRUE)
+
+set.seed(1213)
+event_pctcover_means <- EVENT_COVERS |>
+    filter(poly_id %in% POLYS_KEEP) |>
+    mutate(cover_pct = cover * 100) |>
+    nest_by(event_type, dataset_type) |>
+    summarise(mean = mean(data[['cover_pct']], na.rm = TRUE),
+              boot = list(boot(data = data[['cover_pct']],
+                               statistic = mean.fun, R = 1000))) |>
+    rowwise() |>
+    mutate(boot_ci = list(boot.ci(boot, type = "perc")),
+           boot_lower = boot_ci$percent[4],
+           boot_upper = boot_ci$percent[5]) |>
+    ungroup()
+
+event_pctcover_means
+```
+
+Shortly we'll test if the drone %cover is significantly different to any of the satellite %cover estimates using a paired t-tests.
+
+There is a question about whether the assumption of paired t-tests are sufficiently satisfied. The following plots show that the distributions of %cover values are non-normal, but t-test should be robust to violations of normality with n >~ 30. That the values are percentages and not continuous may be a larger concern
+
+```{r}
+# Plot distribution of % cover estimates at male settlement or nest initiation
+EVENT_COVERS |>
+    filter(!dataset_type %in% c("sentinel_gascoin", "sentinel_binary")) |>
+    ggplot(aes(x = cover)) +
+    geom_histogram() +
+    facet_grid(dataset_type~event_type) +
+    xlab("% cover in 500m buffer at time of nest or settlement event")
+```
+
+```{r}
+# Plot distribution of difference scores in %cover (satellite - drone)
+EVENT_COVERS |>
+    filter(!dataset_type %in% c("sentinel_gascoin", "sentinel_binary")) |>
+    filter(poly_id %in% POLYS_KEEP) |>
+    mutate(cover_pct = cover * 100) |>
+    select(-cover) |>
+    pivot_wider(names_from = "dataset_type", values_from = "cover_pct") |>
+    pivot_longer(matches("sentinel|VIIRS|MODIS"), names_to = "dataset_type",
+                 values_to = "sat_cover") |>
+    mutate(diff = sat_cover - groundtruth) |>
+    ggplot(aes(x = diff)) +
+    geom_histogram() +
+    facet_grid(dataset_type~event_type) +
+    xlab("Difference in percent cover estimate (satellite % - drone %)")
+```
+
+I'll use paired t.tests, and compare the results to the equivalent non-parametric test (Wilcoxon signed rank test
+). They give the same conclusions, so the paired t.test is used in the manuscript.
+```{r}
+# Statistical tests of mean differences: paired t.test
+p_to_stars <- function(pvals){
+    if(pvals < 0.001) return("***")
+    if(pvals < 0.01) return("**")
+    if(pvals < 0.05) return("*")
+    return("")
+}
+
+event_pctcover_pvals <- EVENT_COVERS |>
+    filter(poly_id %in% POLYS_KEEP) |>
+    mutate(cover_pct = cover * 100) |>
+    select(-cover) |>
+    pivot_wider(names_from = "dataset_type", values_from = "cover_pct") |>
+    pivot_longer(matches("sentinel|VIIRS|MODIS"), names_to = "dataset_type",
+                 values_to = "sat_cover") |>
+    nest_by(dataset_type, event_type) |>
+    summarise(
+        ttest = list(t.test(data[['sat_cover']],
+                            data[['groundtruth']], paired = TRUE)),
+        wilcoxtest = list(wilcox.test(data[['sat_cover']],
+                                      data[['groundtruth']], paired = TRUE))) |>
+    ungroup() |>
+    rowwise() |>
+    mutate(t = ttest$statistic,
+           df = ttest$parameter,
+           p_groundtruth_diff = ttest$p.value,
+           pstar = p_to_stars(p_groundtruth_diff),
+           MD = ttest$estimate,
+           pwilcox = wilcoxtest$p.value,
+           pstar_wilcox = p_to_stars(pwilcox))
+event_pctcover_pvals |> select(-ttest, -wilcoxtest)
+```
+
+Prepare data for use in the forest plot
+```{r}
+fp_input_event_cover <- left_join(
+    event_pctcover_means |> select(-boot, -boot_ci),
+    event_pctcover_pvals |> select(-ttest, -matches("wilcox")),
+    by = c("event_type", "dataset_type")
+)
+```
+
+### Time difference between event and reaching 50% cover
+
+Estimate the time difference between the nest or male settlement event, and the date of crossing the 50% cover threshold in the buffer in the 500m buffer around that location.
+
+
+```{r}
+# Reshape data and calculate the time difference between threshold crossing date
+# and nest initiation or male settlement
+event_cover50offset_data <- THRESH_CROSSINGS_LONG |>
+    filter(poly_id %in% POLYS_KEEP) |>
+    filter(!grepl("^pt_|full_plot", poly_id )) |>
+    filter(poly_id %in% POLYS_KEEP) |>
+    filter(thresh == 0.5) |>
+    left_join(EVENT_COVERS |>
+                  select(dataset_type, poly_id, dt_event),
+              by = c("dataset_type", "poly_id")) |>
+    mutate(offset = dtime_days(dt_event, dt_cross),
+           event_type = ifelse(grepl("^M", poly_id), "male_firstcap", "nest_init"))
+```
+
+Check the distribution of time offset data for each group
+```{r}
+event_cover50offset_data |>
+    filter(!dataset_type %in% c("sentinel_gascoin", "sentinel_binary")) |>
+    ggplot(aes(x = offset)) +
+    geom_histogram() +
+    facet_grid(dataset_type~event_type)
+```
+
+And the distribution of difference scores for a paired t test
+
+```{r}
+event_cover50offset_data |>
+    filter(!dataset_type %in% c("sentinel_gascoin", "sentinel_binary")) |>
+    select(dataset_type, poly_id, offset, event_type) |>
+    pivot_wider(names_from = "dataset_type", values_from = "offset") |>
+    pivot_longer(matches("sentinel|VIIRS|MODIS"), names_to = "dataset_type",
+                 values_to = "sat_offset") |>
+    rename(groundtruth_offset = groundtruth) |>
+    mutate(diff = sat_offset - groundtruth_offset) |>
+    ggplot(aes(x = diff)) +
+    geom_histogram() +
+    facet_grid(dataset_type~event_type) +
+    xlab("Difference in offset between groundtruth and satellite dataset")
+```
+
+```{r}
+# Calculate means & boot CIs by group.
+# i.e. the mean delay in days between reaching 50% cover and nest initiation
+event_cover50offset_means <- event_cover50offset_data |>
+    nest_by(event_type, dataset_type) |>
+    summarise(mean = mean(data[['offset']], na.rm = TRUE),
+              boot = list(boot(data = data[['offset']],
+                       statistic = mean.fun, R = 1000))) |>
+    rowwise() |>
+    mutate(boot_ci = list(boot.ci(boot, type = "perc")),
+           boot_lower = boot_ci$percent[4],
+           boot_upper = boot_ci$percent[5]) |>
+    ungroup()
+event_cover50offset_means
+```
+
+```{r}
+# Calculate p values from paired t test and convert to pstar
+event_cover50offset_pvals <- event_cover50offset_data |>
+    select(dataset_type, poly_id, offset, event_type) |>
+    pivot_wider(names_from = "dataset_type", values_from = "offset") |>
+    pivot_longer(matches("sentinel|VIIRS|MODIS"), names_to = "dataset_type",
+                 values_to = "sat_offset") |>
+    rename(groundtruth_offset = groundtruth) |>
+    nest_by(dataset_type, event_type) |>
+    summarise(ttest = list(t.test(data[['sat_offset']],
+                                  data[['groundtruth_offset']],
+                                  paired = TRUE)),
+              wilcoxtest = list(wilcox.test(data[['sat_offset']],
+                                            data[['groundtruth_offset']],
+                                            paired = TRUE))) |>
+    ungroup() |>
+    rowwise() |>
+    mutate(t = ttest$statistic,
+           df = ttest$parameter,
+           p_groundtruth_diff = ttest$p.value,
+           pstar = p_to_stars(p_groundtruth_diff),
+           MD = ttest$estimate,
+           pwilcox = wilcoxtest$p.value,
+           pstar_wilcox = p_to_stars(pwilcox))
+
+event_cover50offset_pvals |> select(-ttest, -wilcoxtest)
+```
+
+Collect data for use in forest plot generation
+```{r}
+fp_input_event_cover50offset <- left_join(
+    event_cover50offset_means |> select(-boot, -boot_ci),
+    event_cover50offset_pvals |> select(-ttest),
+    by = c("event_type", "dataset_type")
+)
+
+```
+
+## Forest plot
+Create forest plot showing A) %cover at the time of events, and B) the timing of events relative to the timing of snowmelt
+
+```{r, fig.width=9.4, fig.height = 5}
+# Create plot template
+forest_template <- ggplot() +
+    geom_linerange(aes(group = dataset_type, colour = dataset_type)) +
+    geom_point(aes(fill = dataset_type, shape = dataset_type, colour = dataset_type),
+               size = 2) + # , colour = "black", ) +
+    theme_bw() +
+    theme(axis.text.y = element_blank(),
+          axis.ticks.y = element_blank(),
+          panel.grid = element_blank(),
+          strip.background = element_rect(fill = NA),
+          axis.title.y = element_blank()) +
+    scale_colour_manual(values = PLOT_COLS) +
+    scale_fill_manual(values = PLOT_COLS) +
+    scale_shape_manual(values = c(16,21:25)) +
+    scale_y_discrete(limits = rev) +
+    scale_linetype_manual(values = c("Groundtruth" = "dotted"),
+                          guide = "none")
+
+# %cover at event : male firstcap
+forest_event_cover_malecap <- forest_template %+%
+    (fp_input_event_cover |>
+         filter(event_type == "male_firstcap") |>
+         filter(!dataset_type %in% c("sentinel_gascoin", "sentinel_binary")) |>
+         mutate(dataset_type = factor(
+             dataset_type, levels = c("groundtruth", names(DATSET_LABELS)),
+             labels = c("groundtruth" = "Groundtruth", DATSET_LABELS)),
+             label = "FSC at male settlement")) +
+    aes(x = mean, xmin = boot_lower, xmax = boot_upper, y = dataset_type) +
+    facet_wrap(~label, ncol = 1) + #+
+    labs(x = "Mean FSC (%)") +
+    coord_cartesian(xlim = c(0, 100))
+forest_event_cover_malecap$layers <- c(
+    geom_vline(aes(xintercept = mean, lty = dataset_type)),
+    forest_event_cover_malecap$layers
+)
+
+# %cover at event : nest init
+forest_event_cover_nest_init <- forest_event_cover_malecap %+%
+    (fp_input_event_cover |>
+         filter(!dataset_type %in% c("sentinel_gascoin", "sentinel_binary")) |>
+         filter(event_type == "nest_init") |>
+         mutate(dataset_type = factor(
+             dataset_type, levels = c("groundtruth", names(DATSET_LABELS)),
+             labels = c("groundtruth" = "Groundtruth", DATSET_LABELS)),
+                label = "FSC at nest initiation"))
+
+# cover50 offset at event: male firstcap
+forest_event_cover50offset_malecap <- forest_template %+%
+    (fp_input_event_cover50offset |>
+         filter(!dataset_type %in% c("sentinel_gascoin", "sentinel_binary")) |>
+         filter(event_type == "male_firstcap") |>
+         mutate(dataset_type = factor(
+             dataset_type, levels = c("groundtruth", names(DATSET_LABELS)),
+             labels = c("groundtruth" = "Groundtruth", DATSET_LABELS)),
+                label = "Male settlement timing relative to snow melt")) +
+    aes(x = mean, xmin = boot_lower, xmax = boot_upper, y = dataset_type) +
+    facet_wrap(~label, ncol = 1) +
+    xlab("Mean offset from 50% melt date (days)") +
+    coord_cartesian(xlim = c(-10, 10))
+forest_event_cover50offset_malecap$layers <- c(
+    geom_vline(aes(xintercept = mean, lty = dataset_type)),
+    geom_vline(xintercept = 0, colour = "grey70"),
+    forest_event_cover50offset_malecap$layers
+)
+
+# cover50 offset at event: nest init
+forest_event_cover50offset_nest_init <- forest_event_cover50offset_malecap %+%
+    (fp_input_event_cover50offset |>
+         filter(!dataset_type %in% c("sentinel_gascoin", "sentinel_binary")) |>
+         filter(event_type == "nest_init") |>
+         mutate(dataset_type = factor(
+             dataset_type, levels = c("groundtruth", names(DATSET_LABELS)),
+             labels = c("groundtruth" = "Groundtruth", DATSET_LABELS)),
+             label = "Nest initiation timing relative to snow melt"))
+
+layout = c(
+"
+AC
+BD
+")
+p_forest <-
+    (forest_event_cover_malecap) + xlab(NULL) +
+    (forest_event_cover_nest_init) +
+    (forest_event_cover50offset_malecap ) + xlab(NULL) +
+    (forest_event_cover50offset_nest_init) +
+    plot_layout(design = layout, guides = "collect") &
+    theme(legend.position = "bottom", legend.title = element_blank())
+p_forest
+```
+
+# 7. Maps & schematics
+
+## Prep data
+
+Prepare regions for map generation
+
+```{r}
+region_largest <- DR_GRID |>
+    st_union() |> st_centroid() |>
+    st_transform(CRS_BARROW) |>
+    st_buffer(8000, endCapStyle = "SQUARE") |>
+    st_transform(CRS_WGS84)
+
+region_large <- DR_GRID |>
+    st_union() |> st_centroid() |>
+    st_transform(CRS_BARROW) |>
+    st_buffer(3000) |>
+    st_transform(CRS_WGS84)
+
+region_small <- DR_GRID |>
+    st_union() |> st_centroid() |>
+    st_transform(CRS_BARROW) |>
+    st_buffer(1000) |>
+    st_transform(CRS_WGS84)
+
+```
+
+```{r}
+library(ggspatial)
+library(tidyterra)
+
+map_stem <- ggplot() +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.text.x=element_blank(),
+          axis.ticks.x=element_blank() ) +
+    scale_fill_gradient2(low = "#FFC107", mid = "grey90", high = "#1E88E5",
+                         midpoint = 0.5, name = "NDSI", limits = c(-0.51, 1.01),
+                         na.value = "transparent") #+
+```
+
+### Load rasters
+```{r}
+f_mod_L2 <- here("data", "satellite", "MOD10_L2", "2022",
+          glue("MOD10_L2_A2022171_2335_061_2022172150852_MOD_Swath_Snow",
+               "_NDSI_9660ca28.tif"))
+f_mod_L3 <- here("data", "satellite", "MYD10A1", "2022",
+          glue("MYD10A1_A2022181_h12v01_061_2022183044532_MOD_Grid_Snow",
+               "_500m_NDSI_7faa76ad.tif"))
+
+f_vnp_L3 <- here("data", "satellite", "VNP10A1", "2022",
+          glue("VNP10A1_A2022170_h12v01_002_2023040180701_VIIRS_Grid_IMG_",
+               "2D_NDSI_2cd1bf2a.tif"))
+
+RASTER_MODIS_L2 <- rast(f_mod_L2)
+RASTER_MODIS_L2_small <- rast(f_mod_L2)
+RASTER_MODIS_L3 <- rast(f_mod_L3)
+RASTER_VIIRS_L3 <- rast(f_vnp_L3)
+
+# Create bounding boxes for cropping and plotting
+crs_utm4N <- st_crs(RASTER_MODIS_L2)
+crs_sigmoidal <- st_crs(RASTER_VIIRS_L3)
+
+croprect_utm <- region_large |> st_transform(crs_utm4N) |>
+    st_bbox()  |> st_as_sfc()
+croprect_sigmoidal <- region_large |> st_transform(crs_sigmoidal) |>
+    st_bbox()  |> st_as_sfc()
+croprect_small <- region_small |> st_transform(crs_utm4N) |>
+    st_bbox() |> st_as_sfc()
+
+# Load rasters
+RASTER_MODIS_L2_small <- RASTER_MODIS_L2_small |> crop(croprect_small)
+RASTER_MODIS_L2 <- RASTER_MODIS_L2 |> crop(croprect_utm)
+RASTER_MODIS_L3 <- RASTER_MODIS_L3 |> crop(croprect_sigmoidal)
+RASTER_VIIRS_L3 <- RASTER_VIIRS_L3 |> crop(croprect_sigmoidal)
+
+plotrect_utm <- st_bbox(RASTER_MODIS_L2) |> st_as_sfc()
+plotrect_sigmoidal <- st_bbox(RASTER_MODIS_L3) |> st_as_sfc()
+plotrect_utm_small <- st_bbox(RASTER_MODIS_L2_small) |> st_as_sfc()
+
+# Scale to regular NDSI range for nicer plot
+RASTER_MODIS_L2_small[] <- RASTER_MODIS_L2_small[] / 10000
+RASTER_MODIS_L2[] <- RASTER_MODIS_L2[] / 10000
+RASTER_MODIS_L3[] <- RASTER_MODIS_L3[] / 10000
+RASTER_VIIRS_L3[] <- RASTER_VIIRS_L3[] / 10000
+
+# Set missing/irregular avalues to -0.5
+RASTER_MODIS_L2_small[RASTER_MODIS_L2_small[] > 1 |
+                          RASTER_MODIS_L2_small[] < -0.5 |
+                          is.na(RASTER_MODIS_L2_small[])] <- NA
+RASTER_MODIS_L2[RASTER_MODIS_L2[] > 1 |
+                    RASTER_MODIS_L2[] < -0.5 |
+                    is.na(RASTER_MODIS_L2[])] <- NA
+RASTER_MODIS_L3[RASTER_MODIS_L3[] > 1 |
+                    RASTER_MODIS_L3[] < -0.5 |
+                    is.na(RASTER_MODIS_L3[])] <- NA
+RASTER_VIIRS_L3[RASTER_VIIRS_L3[] > 1 |
+                    RASTER_VIIRS_L3[] < -0.5|
+                    is.na(RASTER_VIIRS_L3[])] <- NA
+
+```
+
+### Load OSM data
+Get osm data
+
+```{r}
+library(osmdata)
+
+osm_nat <- st_bbox(region_largest) |>
+    opq() |> add_osm_feature(key = 'natural') |> osmdata_sf()
+lakes <- osm_nat$osm_polygons |> filter(natural == "water")
+coastline <- osm_nat$osm_lines
+
+```
+
+
+```{r}
+# Prep OSM layers in different projections cropped to bboxes
+coast_utm <- coastline |> st_transform(crs_utm4N) |>
+    st_intersection(plotrect_utm) |>
+    st_as_sfc() |> vect()
+coast_sig <- coastline |> st_transform(crs_sigmoidal) |>
+    st_intersection(plotrect_sigmoidal) |>
+    st_as_sfc() |> vect()
+coast_small <- coastline |> st_transform(crs_utm4N) |>
+    st_intersection(plotrect_utm_small) |>
+    st_as_sfc() |> vect()
+coast_region <- coastline |> st_intersection(region_largest) |>
+    st_as_sfc() |> vect()
+
+lakes_utm <- lakes |> st_transform(crs_utm4N) |>
+    st_intersection(plotrect_utm) |>
+    vect()
+lakes_sig <- lakes |> st_transform(crs_sigmoidal) |>
+    st_intersection(plotrect_sigmoidal) |>
+    vect()
+lakes_small <- lakes |> st_transform(crs_utm4N) |>
+    st_intersection(plotrect_utm_small) |>
+    vect()
+lakes_region <- lakes |> st_intersection(region_largest) |>
+    st_as_sfc() |> vect()
+
+# Study plot
+site_utm <- EXTENT_DRONE |> st_cast("LINESTRING") |>
+    st_transform(crs_utm4N) |> vect()
+site_sig <- EXTENT_DRONE |> st_cast("LINESTRING") |>
+    st_transform(crs_sigmoidal) |> vect()
+
+# Drone grid
+# QUADRATS # no manipulation needed
+grid_utm <- QUADRATS |>
+    st_transform(crs_utm4N) |> vect()
+
+# 1 nest buffer, 1 malcap buffer
+sample_nest_utm <- PHEN_EVENTS[10,]|> st_transform(crs_utm4N) |> vect()
+sample_malecap_utm <- PHEN_EVENTS[100,]|> st_transform(crs_utm4N) |> vect()
+buff_sample_nest_utm <- BUFFS_500[10,] |>
+    st_transform(crs_utm4N) |>
+    st_cast("LINESTRING") |> vect()
+buff_sample_malecap_utm <- BUFFS_500[100,] |>
+    st_transform(crs_utm4N) |>
+    st_cast("LINESTRING") |> vect()
+
+```
+
+## Alaska region map
+larger region
+```{r, fig.width = 6.2}
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(ggspatial)
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+# Zoomed out map
+world |>
+    st_transform(CRS_BARROW) |>
+    ggplot() +
+    geom_sf(fill = "grey90")  +
+    coord_sf(xlim = c(-4000000, 4000000), ylim = c(-5000000, 0)) +
+    theme_bw() +
+    theme(panel.grid = element_blank(),
+          axis.text = element_blank(),
+          axis.ticks = element_blank())
+
+```
+
+Local region
+```{r}
+p_ML2 <- map_stem +
+    geom_spatvector(data = lakes_region, fill = "grey", alpha = 0.5) +
+    geom_spatvector(data = coast_region ) +
+    geom_spatvector(data = site_utm, colour = "#D81B60") +
+    annotation_scale(location = "tl") +
+    annotation_north_arrow(location = "br", which_north = "true",
+                           style = north_arrow_fancy_orienteering)
+p_ML2
+```
+
+## Plot sample rasters
+
+Prep plot objects
+```{r}
+p_ML2 <- map_stem +
+    geom_spatraster(data = RASTER_MODIS_L2) +
+    geom_spatvector(data = lakes_utm, fill = "grey", alpha = 0.5) +
+    geom_spatvector(data = coast_utm) +
+    geom_spatvector(data = site_utm, colour = "#D81B60") +
+    annotation_scale(location = "tl") +
+    annotation_north_arrow(location = "br", which_north = "true",
+                           style = north_arrow_fancy_orienteering) +
+    ggtitle("MODIS_L2")
+
+p_ML3 <- map_stem +
+    geom_spatraster(data = RASTER_MODIS_L3, na.rm = TRUE) +
+    geom_spatvector(data = lakes_sig, fill = "grey", alpha = 0.5) +
+    geom_spatvector(data = coast_sig) +
+    geom_spatvector(data = site_sig, colour = "#D81B60") +
+    annotation_scale(location = "tl") +
+    annotation_north_arrow(location = "br", which_north = "true",
+                           style = north_arrow_fancy_orienteering) +
+    ggtitle("MODIS_L3")
+
+p_VL3 <- map_stem +
+    geom_spatraster(data = RASTER_VIIRS_L3) +
+    geom_spatvector(data = lakes_utm, fill = "grey", alpha = 0.5) +
+    geom_spatvector(data = coast_sig) +
+    geom_spatvector(data = site_sig, colour = "#D81B60") +
+    annotation_scale(location = "tl") +
+    annotation_north_arrow(location = "br", which_north = "true",
+                           style = north_arrow_fancy_orienteering) +
+    ggtitle("VIIRS_L3")
+
+p_ML2
+p_ML3
+p_VL3
+
+```
+
+## Plot drone grid with MODIS_L2 raster and a nest buffer
+
+```{r}
+map_stem +
+    geom_spatraster(data = RASTER_MODIS_L2_small) +
+    geom_spatvector(data = coast_small) +
+    geom_spatvector(data = lakes_small, fill = "grey", alpha = 0.5) +
+    geom_spatvector(data = site_utm, colour = "#D81B60") +
+    geom_spatvector(data = grid_utm) +
+    geom_spatvector(data = sample_nest_utm, colour = "black") +
+    geom_spatvector(data = buff_sample_nest_utm, colour = "black") +
+    annotation_scale(location = "bl") +
+    annotation_north_arrow(location = "br", which_north = "true",
+                           style = north_arrow_fancy_orienteering)
+
+```
+
+# 8. Supplementary
+
+## FSC bias plot: all datapoints
+
+This plot shows drone FSC versus satellite FSC. Each point represents an individual satellite observation (i.e. an observation of a quadrat from one satellite image).
+
+```{r, fig.width = 6.2, fig.height = 5}
+p_bias_pts <- COVERS_MATCHED_ALL |>
+    filter(!dataset_type %in% c("sentinel_gascoin", "sentinel_binary")) |>
+    filter(grepl("pt", poly_id)) |>
+    mutate(dataset_type = factor(dataset_type,
+                                 levels = names(DATSET_LABELS),
+                                 labels = DATSET_LABELS)) |>
+    ggplot() +
+    geom_abline(intercept = 0, slope = 1, colour = "grey50") +
+    geom_point(aes(x = cover_dr, y = cover_sat),
+               pch = 1, alpha = 0.5) +
+    facet_grid(type~dataset_type, switch = "y") +
+    coord_equal() +
+    xlab("Ground truth FSC (%)") +
+    ylab("Satellite FSC (%)") +
+    theme_bw() +
+    theme(panel.grid = element_blank(),
+          # strip.background.x = element_blank(),
+          strip.background = element_rect(fill = NA)) +
+    theme(axis.text.x = element_text(angle = 90))#+
+
+
+p_bias_pts
+```
+
+## Spatial distribution of phenological events
+
+This map shows where all nest and male settlement sites were, and which were able to be used in the analysis. Excluded points did not have sufficient data points available to fit a snow depletion model, or nest initiation date was not available
+```{r}
+temp <- bind_rows(
+    NEST_INFO |>
+        select(nest, init_dt, geometry) |>
+        rename(poly_id = nest, dt_event = init_dt) |>
+        mutate(event_type = "nest_init"),
+    MALECAPS |>
+        select(maleID, dt_cap, geometry) |>
+        rename(poly_id = maleID, dt_event = dt_cap) |>
+        mutate(event_type = "male_firstcap")) |>
+    mutate(poly_id = paste0(poly_id, "_buff_500")) |>
+    mutate(used = poly_id %in% POLYS_KEEP,
+           event_type = factor(event_type,
+                               levels = c("male_firstcap", "nest_init"),
+                               labels = c("Male settlement sites",
+                                          "Nest sites")))
+p_event_spatial_distribution <- map_stem +
+    geom_spatvector(data = coast_small) +
+    geom_spatvector(data = lakes_small, fill = "grey", alpha = 0.5) +
+    geom_spatvector(data = site_utm, colour = "#D81B60") +
+    geom_spatvector(data = temp, aes(shape = used, colour = event_type)) +
+    scale_shape_manual(values = c(4, 16), name = "Used in analysis") +
+    scale_colour_viridis_d(end = 0.7, name = "Event type") +
+    annotation_scale(location = "bl") +
+    annotation_north_arrow(location = "br", which_north = "true",
+                           style = north_arrow_fancy_orienteering)
+p_event_spatial_distribution
+```
+
+## Snow melt trajectories for every quadrat
+
+Prepare data for plotting
+
+```{r}
+# Fetch glm predictions for every quadrat
+glm_preds_quadrats <- preds_sat_glm |>
+    # Thin out this massive dataset, only keep every 100 rows
+    slice(which(row_number() %% 100 == 1)) |>
+    # Only keep quadrat data, disregard buffers
+    filter(grepl("pt_", poly_id)) |>
+    rename(cover = cover_sat_glm, dt_collect = dt) |>
+    mutate(type = "sat_glm")
+
+# Get individual satellite %cover datapoints for every quadrat
+raw_sat_points_quadrats <- SNOW_SAT_2022_ALL_POLYS |>
+    filter(!dataset_type %in% c("sentinel_gascoin", "sentinel_binary"),
+           grepl("pt_", poly_id)) |>
+    select(dataset_type, poly_id, dt_collect, dt_offset, cover) |>
+    mutate(type = "sat_raw")
+
+# Get individual drone %cover observations for every quadrat
+raw_dr_points_quadrats <- SNOW_DR |>
+    st_drop_geometry() |>
+    select(poly_id, dt, dt_offset, cover) |>
+    rename(dt_collect = dt) |>
+    mutate(type = "gt", dataset_type = "groundtruth")
+
+# Collate
+plotdat_meltcurves_quadrats <-
+    bind_rows(glm_preds_quadrats,
+              raw_sat_points_quadrats,
+              raw_dr_points_quadrats) |>
+    mutate(poly_id = gsub("pt_", "Quadrat_", poly_id),
+           poly_id = gsub("_(?=[0-9]$)", "_0", poly_id, perl = TRUE))
+
+
+```
+
+Generate snow depletion plots for every quadrat and every satellite dataset
+
+```{r}
+
+plts_meltcurves_38pts <-
+    init_list(names = unique(glm_preds_quadrats$dataset_type))
+for (ds in unique(glm_preds_quadrats$dataset_type)){
+    subdat <- plotdat_meltcurves_quadrats |>
+        filter(dataset_type == ds | type == "gt")
+
+    plts_meltcurves_38pts[[ds]] <-
+        ggplot(mapping = aes(x = dt_collect, y = cover)) +
+        geom_line(aes(colour = dataset_type),
+                  data = subdat |> filter(type == "sat_glm")) +
+        geom_line(data = subdat |> filter(type == "gt"), colour = "#c30010") +
+        geom_point(aes(fill = dataset_type),
+                   data = subdat |> filter(type == "sat_raw"),
+                   pch = 21, colour = "black", size = 1) +
+        # geom_point() +
+        facet_wrap(~poly_id) +
+        scale_colour_manual(values = PLOT_COLS, guide = NULL) +
+        scale_fill_manual(values = PLOT_COLS, guide = NULL) +
+        theme_classic() +
+        geom_hline(yintercept = 0) +
+        xlab("Date") +
+        ylab(paste0("FSC from ", DATSET_LABELS[ds], " dataset (%)")) +
+        # scale_shape_manual(values = c(2,1,4)) +
+        # labs(caption = str_wrap(paste0(
+        #     "Figure. %cover estimates at all drone image locations. Black ",
+        #     "line shows groundtruth melt trajectory. Coloured points show",
+        #     " %cover estimates from satellite datasets. Coloured lines shows",
+        #     " a glm fit to satellite data."),
+        #     width = 200))  +
+        theme(plot.caption = element_text(hjust = 0),
+              axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+              strip.text = element_text(size = 8))
+}
+
+plts_meltcurves_38pts$MODIS_L2
+plts_meltcurves_38pts$MODIS_L3
+plts_meltcurves_38pts$VIIRS_L3
+plts_meltcurves_38pts$sentinel_slmnsn_appl
+
+```
+
+## All quadrats vs complete cases comparison
+
+Compare the results if all 38 quadrats are used, versus the subset of 29 quadrats with a snow model able to be fitted for every satellite dataset. Conclusions are not substantially different
+
+```{r}
+# Metrics for all quadrats
+metrics_quad_point_all <- COVERS_MATCHED_ALL |>
+    mutate(cover_sat_pct = cover_sat * 100,
+           cover_dr_pct = cover_dr * 100,
+           bias = cover_sat_pct - cover_dr_pct) |>
+    group_by(dataset_type) |>
+    summarise(mean_bias_pct = mean(bias),
+              rmse = rmse(cover_dr_pct, cover_sat_pct),
+              r = cor(cover_dr_pct, cover_sat_pct)) |>
+    mutate(type = "All quadrats")
+metrics_quad_date_all <- THRESH_CROSSINGS_OFFSET |>
+    filter(grepl("pt_", poly_id)) |>
+    filter(thresh == 0.5) |>
+    group_by(sat_type) |>
+    summarise(mean_bias_days = dtime_days(sat_dt, drone_dt) |>
+                  mean(na.rm = TRUE) |> round(2)) |>
+    map_df(rev) |>
+    mutate(type = "All quadrats")
+
+# Metrics for the subset of 29 quadrats
+metrics_quad_point_subset <- COVERS_MATCHED_ALL |>
+    filter(poly_id %in% POLYS_KEEP) |>
+    mutate(cover_sat_pct = cover_sat * 100,
+           cover_dr_pct = cover_dr * 100,
+           bias = cover_sat_pct - cover_dr_pct) |>
+    group_by(dataset_type) |>
+    summarise(mean_bias_pct = mean(bias),
+              rmse = rmse(cover_dr_pct, cover_sat_pct),
+              r = cor(cover_dr_pct, cover_sat_pct))  |>
+    mutate(type = "Complete cases")
+metrics_quad_date_subset <- THRESH_CROSSINGS_OFFSET |>
+    filter(poly_id %in% POLYS_KEEP) |>
+    filter(grepl("pt_", poly_id)) |>
+    filter(thresh == 0.5) |>
+    group_by(sat_type) |>
+    summarise(mean_bias_days = dtime_days(sat_dt, drone_dt) |>
+                  mean(na.rm = TRUE) |> round(2)) |>
+    map_df(rev) |>
+    mutate(type = "Complete cases")
+
+# Combine and compare results
+tab <- left_join(
+    bind_rows(metrics_quad_point_all, metrics_quad_point_subset),
+    bind_rows(metrics_quad_date_all, metrics_quad_date_subset),
+    by = c("dataset_type" = "sat_type", "type"))
+tab |> filter(!dataset_type %in% c("sentinel_binary", "sentinel_gascoin"))
+```
+
+Show location of the 9 quadrats excluded from the analyses for context
+```{r}
+QUADRATS |>
+    mutate(excluded = !poly_id %in% POLYS_KEEP) |>
+    mapview(zcol = "excluded", layer.name  = "Excluded")
+```
+
+## Sentinel-2 dataset comparison
+
+Compare three methods of estimating FSC using sentinel data. The Salomonson & Appel (2006) correction formula gives the best results. The NDSI threshold using in the Binarization & aggregation approach is likely not well tuned for this study site, and results may be improved with a more appropriate threshold.
+
+```{r}
+p_bias_pts_sentinel <-
+    p_bias_pts %+%
+    (COVERS_MATCHED_ALL |>
+         filter(grepl("sentinel", dataset_type),
+                grepl("Raw", type))) +
+    facet_wrap(~dataset_type, labeller = as_labeller(SENTINEL_LABELS))
+p_bias_pts_sentinel
+```
+
+
+```{r}
+plotdat_thresh_cross_sentinel <- THRESH_CROSSINGS_OFFSET |>
+    filter(grepl("sentinel", sat_type),
+           grepl("pt_", poly_id)) |>
+    mutate(threshfac = factor(thresh),
+           threshfac = factor(threshfac, levels = rev(levels(threshfac))),
+           days_diff = dtime_days(sat_dt, drone_dt)) |>
+    filter(threshfac %in% c("0.25", "0.5", "0.75")) |>
+    # filter(threshfac %in% c("0.05", "0.25", "0.5", "0.75")) |>
+    mutate(thresh = case_when(
+        # threshfac == 0.05 ~ " 5%",
+        threshfac == 0.25 ~ "25%",
+        threshfac == 0.5 ~ "50%",
+        threshfac == 0.75 ~ "75%")) |>
+    mutate(thresh = factor(thresh),
+           thresh = factor(thresh, levels = rev(levels(thresh))))
+
+
+temp_cols <- PLOT_COLS[grepl("sentinel_", names(PLOT_COLS))]
+temp_labs <- SENTINEL_LABELS[names(temp_cols)]
+p_bias_date_sentinel <-
+    p_bias_date %+%
+    plotdat_thresh_cross_sentinel +
+    scale_fill_manual(values = temp_cols, labels = temp_labs) +
+    scale_colour_manual(values = temp_cols, labels = temp_labs) +
+    theme(legend.title = element_blank())
+p_bias_date_sentinel
+```
+
+# 9. Export images to pdf
+
+## Main text figures
+
+(main) Melt Trajectories
+(main) Bias
+(main) Bias stratified
+(main) Bias date
+(main) Forest
+```{r}
+ggsave(plot = p_snow_depletion_cumsum,
+       filename = "1_snow_depletion_fullplot.png",
+       path = here("outputs", "plots_manuscript"),
+       width = 16.5, height = 12, units = "cm",
+       dpi = 300, create.dir = TRUE)
+ggsave(plot = p_bias_fsc,
+       filename = "3_bias_stratified.png",
+       path = here("outputs", "plots_manuscript"),
+       width = 16.5, height = 13, units = "cm",
+       dpi = 300, create.dir = TRUE)
+ggsave(plot = p_bias_date,
+       filename = "4_bias_date.png",
+       path = here("outputs", "plots_manuscript"),
+       width = 16.5, height = 12, units = "cm",
+       dpi = 300, create.dir = TRUE)
+ggsave(plot = p_forest,
+       filename = "5_Forest.png",
+       path = here("outputs", "plots_manuscript"),
+       width = 22.5, height = 10.5, units = "cm",
+       dpi = 300, create.dir = TRUE)
+```
+
+
+## Supplementary figures
+(supp) blue thresholds
+(supp) Melt trajectories
+(supp) Bias sentinel
+(supp) Bias sentinel stratified
+(supp) Bias sentinel date
+(supp) All quadrat vs 29 quadrat analyses
+(supp) nest spatial distribution
+
+```{r}
+ggsave(plot = p_bias_pts,
+       filename = "sup_bias_points.png",
+       path = here("outputs", "plots_manuscript"),
+       width = 16.5, height = 12, units = "cm",
+       dpi = 300, create.dir = TRUE)
+ggsave(plot = plts_meltcurves_38pts$MODIS_L2,
+       filename = "sup_Meltcurves_quadrats_MODIS_L2.png",
+       path = here("outputs", "plots_manuscript"),
+       width = 22.5, height = 14.5, units = "cm",
+       dpi = 300, create.dir = TRUE)
+ggsave(plot = plts_meltcurves_38pts$MODIS_L3,
+       filename = "sup_Meltcurves_quadrats_MODIS_L3.png",
+       path = here("outputs", "plots_manuscript"),
+       width = 22.5, height = 14.5, units = "cm",
+       dpi = 300, create.dir = TRUE)
+
+ggsave(plot = plts_meltcurves_38pts$VIIRS_L3,
+       filename = "sup_Meltcurves_quadrats_VIIRS_L3.png",
+       path = here("outputs", "plots_manuscript"),
+       width = 22.5, height = 14.5, units = "cm",
+       dpi = 300, create.dir = TRUE)
+
+ggsave(plot = plts_meltcurves_38pts$sentinel_slmnsn_appl,
+       filename = "sup_Meltcurves_quadrats_sentinel_slmnsn_appl.png",
+       path = here("outputs", "plots_manuscript"),
+       width = 22.5, height = 14.5, units = "cm",
+       dpi = 300, create.dir = TRUE)
+```
+
+Sentinel-2 FSC method comparison
+
+```{r}
+ggsave(plot = p_bias_pts_sentinel,
+       filename = "sup_bias_points_sentinel.png",
+       path = here("outputs", "plots_manuscript"),
+       width = 16.5, height = 8, units = "cm",
+       dpi = 300, create.dir = TRUE)
+ggsave(plot = p_bias_date_sentinel,
+       filename = "sup_bias_date_sentinel.png",
+       path = here("outputs", "plots_manuscript"),
+       width = 16.5, height = 10, units = "cm",
+       dpi = 300, create.dir = TRUE)
+
+```
+
+Maps
+```{r}
+ggsave(plot = p_event_spatial_distribution,
+       filename = "sup_event_spatial_distribution.png",
+       path = here("outputs", "plots_manuscript"),
+       width = 16.5, height = 12, units = "cm",
+       dpi = 300, create.dir = TRUE)
+```

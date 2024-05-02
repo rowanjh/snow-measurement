@@ -1,0 +1,5 @@
+*.RData
+data
+outputs
+*.html
+.Rproj.user

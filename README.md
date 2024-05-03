@@ -61,7 +61,7 @@ The dataset is available at [Edmond](https://edmond.mpg.de/privateurl.xhtml?toke
 
 -   `bird-monitoring` contains data from the field study, including datasets for capture, nests, eggs, and field GPS.
 -   `drone-photos` contains raw DNG photographs captured by the drone camera during snow surveys. 
--   `drone-sampling-coords` contains a csv file with the coordinates of where photographs were taken during the drone surveys.
+-   `drone-sampling-coords` contains a csv file with the coordinates of where drone photographs were taken.
 -   `plot-outline` a shapefile giving the outline of the study plot.
 -   `satellite` contains satellite rasters for MODIS and VIIRS datasets downloaded from NSIDC's data access API. Sentinel-2 summary data files are also given, which were produced using the scripts at [RGEE_Snowmelt](https://github.com/TVersluijs/RGEE_Snowmelt).
--   `satellite-roi` a shapefile with a polygon containing the study site and surrounding area, which is used for spatial subsetting when fetching data from the NSIDC API.
+-   `satellite-roi` a shapefile with a polygon containing the larger area surrounding the study site, which is used for spatial subsetting when fetching satellite data from the NSIDC API.

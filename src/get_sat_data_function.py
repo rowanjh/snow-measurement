@@ -1,13 +1,7 @@
 # ~~~~~~~~~~~~~~~ Script overview ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~----
 #' This script is provided with the following paper:
 #' 
-#' Jacques-Hamilton, Valcu, Kwon, Versluijs & Kempenaers (2024).  
-#'      Measurement error in remotely sensed fractional snow cover datasets: 
-#'      implications for ecological research.
-#' 
-#' Full code repository is available at:
-#' https://github.com/rowanjh/barrow-snowmelt
-#' 
+#' <Anonymized>
 #' -----------
 #' Description
 #' -----------

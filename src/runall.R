@@ -1,16 +1,8 @@
 # ~~~~~~~~~~~~~~ Script overview ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~----
 #' This script runs the analyses for the following study:
 #' 
-#' Jacques-Hamilton, Valcu, Kwon, Versluijs & Kempenaers (2024).  
-#'      Measurement error in remotely sensed fractional snow cover datasets: 
-#'      implications for ecological research.
-#' 
-#' Code available at:
-#' https://github.com/<anonymized>
-#' 
-#' Data available at:
-#' https://zenodo.org/records/<anonymized
-#' 
+#' <Anonymized>
+#'  
 #' Purpose: 
 #'      Code is provided for the following steps in the analyses:
 #'      1. Drone photograph processing
@@ -18,7 +10,7 @@
 #'      3. Reproduction of figures and tables in manuscript
 #'      
 #'      Sentinel-2 data extraction is conducted using code from the RGEE 
-#'      repository available here: https://github.com/TVersluijs/RGEE_Snowmelt
+#'      repository available here: <Anonymized>
 #'
 #' Instructions to run:
 #'      Install packages: 

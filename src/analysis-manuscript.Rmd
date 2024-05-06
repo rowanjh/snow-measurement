@@ -549,9 +549,10 @@ sat_glmpreds_dronematch <-
 # Now join the satellite %cover predictions to the drone %cover estimates
 COVERS_MATCHED_INTERP <- SNOW_DR |>
     st_drop_geometry() |>
-    select(poly_id, dt, date, cover) |>
+    select(poly_id, dt, rowid, date, cover) |>
     rename(cover_dr = cover,
-           dt_ground = dt) |>
+           dt_ground = dt,
+           rowid_drone = rowid) |>
     left_join(sat_glmpreds_dronematch, by = c("poly_id", "date")) |>
     select(-date) |>
     # For some polygons a snow cover model could not be fit e.g. due to
@@ -1130,7 +1131,7 @@ p_snow_depletion_cumsum <- p_snow_depletion_fullplot +
 p_snow_depletion_cumsum
 ```
 
-## Forest plot
+## Forest plot inputs
 
 We estimate how nest initiation and male settlement relate to %cover and the timing of snow melt in the local 500m buffer.
 
@@ -1153,7 +1154,7 @@ event_pctcover_means <- EVENT_COVERS |>
     nest_by(event_type, dataset_type) |>
     summarise(mean = mean(data[['cover_pct']], na.rm = TRUE),
               boot = list(boot(data = data[['cover_pct']],
-                               statistic = mean.fun, R = 1000))) |>
+                               statistic = mean.fun, R = 10000))) |>
     rowwise() |>
     mutate(boot_ci = list(boot.ci(boot, type = "perc")),
            boot_lower = boot_ci$percent[4],
@@ -1194,8 +1195,7 @@ EVENT_COVERS |>
     xlab("Difference in percent cover estimate (satellite % - drone %)")
 ```
 
-I'll use paired t.tests, and compare the results to the equivalent non-parametric test (Wilcoxon signed rank test
-). They give the same conclusions, so the paired t.test is used in the manuscript.
+I'll use paired t.tests, and compare the results to the equivalent non-parametric test (Wilcoxon signed rank test) and bootstrapping. They give the same conclusions, so the paired t.test is used in the manuscript.
 ```{r}
 # Statistical tests of mean differences: paired t.test
 p_to_stars <- function(pvals){
@@ -1204,7 +1204,6 @@ p_to_stars <- function(pvals){
     if(pvals < 0.05) return("*")
     return("")
 }
-
 event_pctcover_pvals <- EVENT_COVERS |>
     filter(poly_id %in% POLYS_KEEP) |>
     mutate(cover_pct = cover * 100) |>
@@ -1212,12 +1211,15 @@ event_pctcover_pvals <- EVENT_COVERS |>
     pivot_wider(names_from = "dataset_type", values_from = "cover_pct") |>
     pivot_longer(matches("sentinel|VIIRS|MODIS"), names_to = "dataset_type",
                  values_to = "sat_cover") |>
+    mutate(diff = sat_cover - groundtruth) |>
     nest_by(dataset_type, event_type) |>
     summarise(
         ttest = list(t.test(data[['sat_cover']],
                             data[['groundtruth']], paired = TRUE)),
         wilcoxtest = list(wilcox.test(data[['sat_cover']],
-                                      data[['groundtruth']], paired = TRUE))) |>
+                                      data[['groundtruth']], paired = TRUE)),
+      boot = list(boot(data = data[['diff']],
+               statistic = mean.fun, R = 10000))) |>
     ungroup() |>
     rowwise() |>
     mutate(t = ttest$statistic,
@@ -1226,7 +1228,13 @@ event_pctcover_pvals <- EVENT_COVERS |>
            pstar = p_to_stars(p_groundtruth_diff),
            MD = ttest$estimate,
            pwilcox = wilcoxtest$p.value,
-           pstar_wilcox = p_to_stars(pwilcox))
+           pstar_wilcox = p_to_stars(pwilcox),
+           boot_ci = list(boot.ci(boot, type = "perc")),
+           boot_lower = boot_ci$percent[4],
+           boot_upper = boot_ci$percent[5],
+           sig = boot_lower > 0 | boot_upper < 0) |>
+    ungroup()
+
 event_pctcover_pvals |> select(-ttest, -wilcoxtest)
 ```
 
@@ -1292,7 +1300,7 @@ event_cover50offset_means <- event_cover50offset_data |>
     nest_by(event_type, dataset_type) |>
     summarise(mean = mean(data[['offset']], na.rm = TRUE),
               boot = list(boot(data = data[['offset']],
-                       statistic = mean.fun, R = 1000))) |>
+                       statistic = mean.fun, R = 10000))) |>
     rowwise() |>
     mutate(boot_ci = list(boot.ci(boot, type = "perc")),
            boot_lower = boot_ci$percent[4],
@@ -1722,6 +1730,24 @@ p_bias_pts <- COVERS_MATCHED_ALL |>
 p_bias_pts
 ```
 
+## Table: GLM bias
+
+```{r}
+sat_covers_matched <- 
+    left_join(SNOW_SAT_2022 |>
+                  select(dataset_type, poly_id, dt_collect, cover), 
+              preds_sat_glm |> 
+                  filter(dt %in% SNOW_SAT_2022$dt_collect) |> 
+                  select(dataset_type, poly_id, dt, cover_sat_glm), 
+              by = c("dataset_type", "poly_id", "dt_collect" = "dt"))
+
+sat_covers_matched |> 
+    mutate(glm_error = (cover_sat_glm -cover)*100) |> 
+    filter(!is.na(glm_error)) |> 
+    group_by(dataset_type) |> 
+    summarise(glm_bias = mean(glm_error),
+              rounded = format(round(glm_bias, 2), nsmall = 2))
+```
 ## Spatial distribution of phenological events
 
 This map shows where all nest and male settlement sites were, and which were able to be used in the analysis. Excluded points did not have sufficient data points available to fit a snow depletion model, or nest initiation date was not available

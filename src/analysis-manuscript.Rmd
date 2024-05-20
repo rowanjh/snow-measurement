@@ -1238,7 +1238,7 @@ Prepare data for use in the forest plot
 ```{r}
 fp_input_event_cover <- left_join(
     event_pctcover_means |> select(-boot, -boot_ci),
-    event_pctcover_pvals |> select(-ttest, -matches("wilcox")),
+    event_pctcover_pvals |> select(-ttest, -matches("wilcox"), -matches("boot")),
     by = c("event_type", "dataset_type")
 )
 ```

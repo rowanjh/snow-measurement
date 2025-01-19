@@ -9,13 +9,13 @@ output:
 # 1. Overview
 This notebook reproduces analyses from the below manuscript:
 
-Jacques-Hamilton, R., Valcu, M., Kwon, E.K., Versluijs, T., & Kempenaers, B. (2024). Measurement error in remotely sensed fractional snow cover datasets: implications for ecological research.
+Jacques-Hamilton, R., Valcu, M., Kwon, E.K., Versluijs, T., & Kempenaers, B. (2025). Measurement error in remotely sensed fractional snow cover datasets: implications for ecological research. Environmental Research: Ecology. https://doi.org/10.1088/2752-664X/ada8b3
 
 Full code repository available at:
-https://github.com/rowanjh/barrow-snowmelt
+https://github.com/rowanjh/snow-measurement
 
 Data available at:
-https://zenodo.org/records/...
+https://edmond.mpg.de/privateurl.xhtml?token=9a080a7e-ba68-4777-bb40-3763dbe3fe90
 
 
 ```{r}

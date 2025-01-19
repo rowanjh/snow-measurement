@@ -4,7 +4,7 @@
 
 This is the code repository for the following paper:
 
-`Jacques-Hamilton, R., Valcu, M., Kwon, E., Versluijs, T.S.L., & Kempenaers, B (2025). Measurement error in remotely sensed fractional snow cover datasets: implications for ecological research. Environmental Research Ecology, in press.`  
+`Jacques-Hamilton, R., Valcu, M., Kwon, E., Versluijs, T.S.L., & Kempenaers, B (2025). Measurement error in remotely sensed fractional snow cover datasets: implications for ecological research. Environmental Research Ecology, in press. https://doi.org/10.1088/2752-664X/ada8b3`  
 
 # Overview
 
@@ -14,7 +14,7 @@ This paper quantifies measurement error in common satellite-derived fractional s
 
 The dataset for this study can be downloaded from a repository on [Edmond](https://edmond.mpg.de/privateurl.xhtml?token=9a080a7e-ba68-4777-bb40-3763dbe3fe90).
 
-The code is available on Github (link removed for review).
+The code is available on [Github](https://github.com/rowanjh/snow-measurement).
 
 ## Instructions
 

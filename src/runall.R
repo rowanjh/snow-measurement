@@ -1,15 +1,16 @@
 # ~~~~~~~~~~~~~~ Script overview ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~----
 #' This script runs the analyses for the following study:
 #' 
-#' Jacques-Hamilton, Valcu, Kwon, Versluijs & Kempenaers (2024).  
+#' Jacques-Hamilton, Valcu, Kwon, Versluijs & Kempenaers (2025).  
 #'      Measurement error in remotely sensed fractional snow cover datasets: 
-#'      implications for ecological research.
+#'      implications for ecological research. Environmental Research: Ecology
+#'      https://doi.org/10.1088/2752-664X/ada8b3
 #' 
 #' Code available at:
-#' https://github.com/<anonymized>
+#' https://github.com/rowanjh/snow-measurement
 #' 
 #' Data available at:
-#' https://zenodo.org/records/<anonymized
+#' https://edmond.mpg.de/privateurl.xhtml?token=9a080a7e-ba68-4777-bb40-3763dbe3fe90
 #' 
 #' Purpose: 
 #'      Code is provided for the following steps in the analyses:
